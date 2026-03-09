@@ -192,8 +192,12 @@ export default function App() {
   const parseQuestionsFromText = useCallback((rawText) => {
     const text = (rawText || "").replace(/\r/g, "");
     const allLines = text.split("\n").map((line) => line.trimEnd());
-    const questionRe = /^\s*(?:q(?:uestion)?\s*)?(\d{1,4})\s*[\).:\-]\s*(.+)$/i;
+    const questionRe = /^\s*(?:q(?:uestion)?\s*)?(\d{1,4})\s*(?:(?:\.(?!\d))|\)|:(?!\d)|\-(?!\s*\d)\s*)(.+)$/i;
     const choiceRe = /^\s*([A-H])\s*[\).:\-]\s*(.+)$/i;
+    const startsWithChoiceLabelRe = /^\s*[A-H]\s*[\).:\-]/i;
+    const rangeOnlyRe = /^\s*\d+(?:\.\d+)?\s*[-–]\s*\d+(?:\.\d+)?\s*$/;
+    const questionCueRe = /\b(?:what|which|who|when|where|why|how|find|calculate|determine|compute|evaluate|identify|construct)\b/i;
+    const imperativeQuestionCueRe = /\b(?:find|calculate|determine|compute|evaluate|identify|construct)\b/i;
     const answerLabelRe = /^\s*(?:answer|correct answer|answer key|key answer|ans(?:wer)?(?:\s*key)?)\s*[:\-]\s*(.*)$/i;
     const answerKeyHeadingRe = /^\s*(?:answer\s*key(?:\s*&\s*rationale)?|key\s*answers?|answer\s*keys)\s*[:\-]?\s*$/i;
     const answerKeyHeadingWithContentRe = /^\s*(?:answer\s*key(?:\s*&\s*rationale)?|key\s*answers?|answer\s*keys)\s*[:\-]\s*(.+)$/i;
@@ -203,10 +207,41 @@ export default function App() {
     const answerSectionLines = [];
     const rationaleSectionLines = [];
 
-    const firstQuestionIdx = allLines.findIndex((line) => questionRe.test(line));
+    const isLikelyQuestionLine = (line) => {
+      const trimmed = line.trim();
+      if (!trimmed) return false;
+      if (startsWithChoiceLabelRe.test(trimmed)) return false;
+      if (answerKeyHeadingRe.test(trimmed) || rationaleKeyHeadingRe.test(trimmed)) return false;
+      if (/^\s*(?:directions?|instruction|note)\s*[:\-]/i.test(trimmed)) return false;
+      if (rangeOnlyRe.test(trimmed)) return false;
+      if (!questionCueRe.test(trimmed)) return false;
+      if (/\?\s*$/.test(trimmed)) return true;
+      return imperativeQuestionCueRe.test(trimmed);
+    };
+
+    const splitChoicesFromLine = (line) => {
+      const trimmed = line.trim();
+      if (!startsWithChoiceLabelRe.test(trimmed)) return [];
+      const markerRe = /(^|\s+)([A-H])\s*[\).:\-]\s*?/gi;
+      const markers = [...trimmed.matchAll(markerRe)];
+      if (markers.length === 0 || (markers[0].index ?? 0) > 2) return [];
+
+      const extractedChoices = [];
+      markers.forEach((marker, idx) => {
+        const start = (marker.index ?? 0) + marker[0].length;
+        const end = idx + 1 < markers.length ? (markers[idx + 1].index ?? trimmed.length) : trimmed.length;
+        const body = trimmed.slice(start, end).replace(/\s+/g, " ").trim();
+        extractedChoices.push(`${marker[2].toUpperCase()}. ${body}`.trim());
+      });
+      return extractedChoices;
+    };
+
+    const firstQuestionIdx = allLines.findIndex((line) => questionRe.test(line) || isLikelyQuestionLine(line));
     let title = "Test";
     if (firstQuestionIdx > 0) {
-      const maybeTitle = allLines.slice(0, firstQuestionIdx).find((line) => line.trim().length > 0);
+      const headingLines = allLines.slice(0, firstQuestionIdx).map((line) => line.trim()).filter(Boolean);
+      const keywordTitle = [...headingLines].reverse().find((line) => /(exam|quiz|test|assessment|periodical)/i.test(line));
+      const maybeTitle = keywordTitle || headingLines[0];
       if (maybeTitle) {
         title = maybeTitle.replace(/^(?:title|quiz|test)\s*[:\-]\s*/i, "").trim() || "Test";
       }
@@ -286,12 +321,12 @@ export default function App() {
       }
 
       const qMatch = line.match(questionRe);
-      if (qMatch) {
+      if (qMatch || isLikelyQuestionLine(line)) {
         mode = "questions";
         finalizeCurrent();
         current = {
-          number: Number(qMatch[1]),
-          question: qMatch[2].trim(),
+          number: qMatch ? Number(qMatch[1]) : extracted.length + 1,
+          question: qMatch ? qMatch[2].trim() : line.trim(),
           choices: [],
           answer: "",
           rationale: ""
@@ -301,6 +336,25 @@ export default function App() {
       }
 
       if (!current) return;
+
+      const parsedInlineChoices = splitChoicesFromLine(line);
+      if (parsedInlineChoices.length > 0) {
+        const choiceIndexByLetter = new Map(
+          current.choices.map((choice, idx) => [choice.trim().charAt(0).toUpperCase(), idx])
+        );
+        parsedInlineChoices.forEach((choice) => {
+          const letter = choice.trim().charAt(0).toUpperCase();
+          const existingIdx = choiceIndexByLetter.get(letter);
+          if (existingIdx !== undefined) {
+            current.choices[existingIdx] = choice;
+          } else {
+            current.choices.push(choice);
+            choiceIndexByLetter.set(letter, current.choices.length - 1);
+          }
+        });
+        section = "choice";
+        return;
+      }
 
       const choiceMatch = line.match(choiceRe);
       if (choiceMatch) {
