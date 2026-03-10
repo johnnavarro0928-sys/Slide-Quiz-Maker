@@ -204,8 +204,18 @@ export default function App() {
     const rationaleKeyHeadingRe = /^\s*(?:rationale(?:\s*key)?|rationales|explanation(?:s)?(?:\s*key)?|reason(?:ing)?(?:\s*key)?)\s*[:\-]?\s*$/i;
     const rationaleKeyHeadingWithContentRe = /^\s*(?:rationale(?:\s*key)?|rationales|explanation(?:s)?(?:\s*key)?|reason(?:ing)?(?:\s*key)?)\s*[:\-]\s*(.+)$/i;
     const rationaleRe = /^\s*(?:rationale|explanation|reason(?:ing)?)\s*[:\-]\s*(.*)$/i;
+    const subjectHeadingRe = /^\s*(music|arts|health|pe|p\.?\s*e\.?|physical education)\s*$/i;
     const answerSectionLines = [];
     const rationaleSectionLines = [];
+
+    const canonicalizeSubject = (line) => {
+      const normalized = line.replace(/\./g, "").replace(/\s+/g, " ").trim().toUpperCase();
+      if (normalized === "MUSIC") return "MUSIC";
+      if (normalized === "ARTS") return "ARTS";
+      if (normalized === "HEALTH") return "HEALTH";
+      if (normalized === "PE" || normalized === "P E" || normalized === "PHYSICAL EDUCATION") return "PE";
+      return null;
+    };
 
     const isLikelyQuestionLine = (line) => {
       const trimmed = line.trim();
@@ -222,7 +232,7 @@ export default function App() {
     const splitChoicesFromLine = (line) => {
       const trimmed = line.trim();
       if (!startsWithChoiceLabelRe.test(trimmed)) return [];
-      const markerRe = /(^|\s+)([A-H])\s*[\).:\-]\s*?/gi;
+      const markerRe = /([A-H])\s*[\).:\-]\s*/g;
       const markers = [...trimmed.matchAll(markerRe)];
       if (markers.length === 0 || (markers[0].index ?? 0) > 2) return [];
 
@@ -231,17 +241,53 @@ export default function App() {
         const start = (marker.index ?? 0) + marker[0].length;
         const end = idx + 1 < markers.length ? (markers[idx + 1].index ?? trimmed.length) : trimmed.length;
         const body = trimmed.slice(start, end).replace(/\s+/g, " ").trim();
-        extractedChoices.push(`${marker[2].toUpperCase()}. ${body}`.trim());
+        extractedChoices.push(`${marker[1].toUpperCase()}. ${body}`.trim());
       });
       return extractedChoices;
+    };
+
+    const parseSubjectAnswerKeyMap = (keyLines) => {
+      const bySubject = new Map();
+      let activeSubject = null;
+
+      keyLines.forEach((rawLine) => {
+        const line = rawLine.trim();
+        if (!line) return;
+
+        const subject = canonicalizeSubject(line);
+        if (subject) {
+          activeSubject = subject;
+          if (!bySubject.has(subject)) bySubject.set(subject, []);
+          return;
+        }
+
+        if (!activeSubject) return;
+        const subjectAnswers = bySubject.get(activeSubject);
+        const letters = [...line.matchAll(/\b([A-H])\b/gi)].map((match) => match[1].toUpperCase());
+        if (letters.length > 0) subjectAnswers.push(...letters);
+      });
+
+      return bySubject;
+    };
+
+    const isLikelyUnlabeledChoiceLine = (line) => {
+      if (!line) return false;
+      if (startsWithChoiceLabelRe.test(line)) return false;
+      if (subjectHeadingRe.test(line)) return false;
+      if (answerLabelRe.test(line) || rationaleRe.test(line)) return false;
+      if (questionRe.test(line) || isLikelyQuestionLine(line)) return false;
+      return true;
     };
 
     const firstQuestionIdx = allLines.findIndex((line) => questionRe.test(line) || isLikelyQuestionLine(line));
     let title = "Test";
     if (firstQuestionIdx > 0) {
       const headingLines = allLines.slice(0, firstQuestionIdx).map((line) => line.trim()).filter(Boolean);
-      const keywordTitle = [...headingLines].reverse().find((line) => /(exam|quiz|test|assessment|periodical)/i.test(line));
-      const maybeTitle = keywordTitle || headingLines[0];
+      const titleCandidateLines = headingLines.filter(
+        (line) => !/^\s*(?:directions?|general instruction|instruction|multiple choice)\b/i.test(line)
+      );
+      const keywordTitle = [...titleCandidateLines].reverse().find((line) => /(exam|quiz|test|assessment|periodical)/i.test(line));
+      const maybeTitle = keywordTitle || titleCandidateLines[0] || headingLines[0];
       if (maybeTitle) {
         title = maybeTitle.replace(/^(?:title|quiz|test)\s*[:\-]\s*/i, "").trim() || "Test";
       }
@@ -249,13 +295,16 @@ export default function App() {
 
     const extracted = [];
     let current = null;
+    let currentSubject = null;
     let section = "question";
     let mode = "questions";
+    let choiceMode = null;
 
     const finalizeCurrent = () => {
       if (!current || !current.question.trim()) return;
       extracted.push({
         number: current.number || extracted.length + 1,
+        subject: current.subject || currentSubject || null,
         question: current.question.replace(/\s+/g, " ").trim(),
         choices: current.choices.map((choice) => choice.replace(/\s+/g, " ").trim()),
         answer: normalizeAnswer(current.answer, current.choices),
@@ -263,6 +312,7 @@ export default function App() {
       });
       current = null;
       section = "question";
+      choiceMode = null;
     };
 
     allLines.forEach((rawLine) => {
@@ -320,18 +370,26 @@ export default function App() {
         return;
       }
 
+      if (mode === "questions" && subjectHeadingRe.test(line)) {
+        finalizeCurrent();
+        currentSubject = canonicalizeSubject(line);
+        return;
+      }
+
       const qMatch = line.match(questionRe);
       if (qMatch || isLikelyQuestionLine(line)) {
         mode = "questions";
         finalizeCurrent();
         current = {
           number: qMatch ? Number(qMatch[1]) : extracted.length + 1,
+          subject: currentSubject,
           question: qMatch ? qMatch[2].trim() : line.trim(),
           choices: [],
           answer: "",
           rationale: ""
         };
         section = "question";
+        choiceMode = null;
         return;
       }
 
@@ -353,6 +411,7 @@ export default function App() {
           }
         });
         section = "choice";
+        choiceMode = "labeled";
         return;
       }
 
@@ -360,7 +419,28 @@ export default function App() {
       if (choiceMatch) {
         current.choices.push(`${choiceMatch[1].toUpperCase()}. ${choiceMatch[2].trim()}`);
         section = "choice";
+        choiceMode = "labeled";
         return;
+      }
+
+      if (isLikelyUnlabeledChoiceLine(line)) {
+        const normalizedLine = line.replace(/\s+/g, " ").trim();
+        const canStartUnlabeledChoices =
+          section === "question" &&
+          current.choices.length === 0 &&
+          /[?]$/.test(current.question);
+        const canContinueUnlabeledChoices =
+          section === "choice" &&
+          choiceMode === "unlabeled" &&
+          current.choices.length > 0 &&
+          current.choices.length < 4;
+
+        if (canStartUnlabeledChoices || canContinueUnlabeledChoices) {
+          current.choices.push(normalizedLine);
+          section = "choice";
+          choiceMode = "unlabeled";
+          return;
+        }
       }
 
       const answerMatch = line.match(answerLabelRe);
@@ -398,10 +478,21 @@ export default function App() {
 
     finalizeCurrent();
     const answerKeyMap = parseAnswerKeyMap(answerSectionLines);
+    const subjectAnswerKeyMap = parseSubjectAnswerKeyMap(answerSectionLines);
     const rationaleKeyMap = parseRationaleKeyMap(rationaleSectionLines);
+    const subjectAnswerCursor = new Map();
 
     extracted.forEach((q) => {
-      const fallbackLetter = answerKeyMap.get(q.number);
+      let fallbackLetter = answerKeyMap.get(q.number);
+      if (!fallbackLetter && q.subject && subjectAnswerKeyMap.has(q.subject)) {
+        const idx = subjectAnswerCursor.get(q.subject) || 0;
+        const letter = subjectAnswerKeyMap.get(q.subject)[idx];
+        if (letter) {
+          fallbackLetter = letter;
+          subjectAnswerCursor.set(q.subject, idx + 1);
+        }
+      }
+
       if (fallbackLetter && (!q.answer || q.answer === "Not provided")) {
         q.answer = normalizeAnswer(fallbackLetter, q.choices);
       }
